@@ -1,0 +1,619 @@
+#!/bin/bash
+
+
+#============================================================================================================================================================
+#Description block
+
+#Error code:
+#   1	incorrect name of chain
+#   2	incorrect params $2 in F_GET_IP_FROM_RANGE, must be "first" or "last"
+#   3	nat->mask must be >= then local-net->mask
+#   4	info: don't cover subnet
+#   5	incorrect input variables
+#   6	local_nets->mask < 16
+
+#============================================================================================================================================================
+#Variables block
+
+IPT="/sbin/iptables-restore"
+F="$(echo $0).sc"
+
+
+#============================================================================================================================================================
+#Functions block
+
+#Format: $0 $WAN_IFACES
+#Return ${err_code}, ${wan_iface[$idx]}, ${wan_iface_count}
+function F_LOAD_WAN_IFACES
+{
+    local idx=0
+    array="${1},"
+    while [ $array ]
+    do
+	idx=$((idx+1))
+	wan_iface[$idx]=$(echo $array | cut -d "," -f1)
+	array=$(echo $array | cut -d "," -f2-)
+    done
+    wan_iface_count=${idx}
+    err_code=0
+    return ${err_code}
+}
+
+#Format: $0 91.221.190.[1-126] first|last
+#Return err_code and $ip
+function F_GET_IP_FROM_RANGE
+{
+    ip=$(echo $1 | cut -d "." -f1-3)
+    case $2 in
+	"first"	)
+	    ip="${ip}.$(echo $1 | cut -d "[" -f2 | cut -d "-" -f1)"
+	    err_code=0
+	    return ${err_code}
+	;;
+	"last"	)
+	    ip="${ip}.$(echo $1 | cut -d "-" -f2 | cut -d "]" -f1)"
+	    err_code=0
+	    return ${err_code}
+	;;
+	*	)
+	    err_code=2
+	    return ${err_code}
+	;;
+    esac
+}
+
+#Format: $0 $array_wan_pool
+#Return ${err_code}, ${wan[$idx]}, ${wan_count}
+function F_LOAD_GLOBAL_ADDRESS
+{
+    idx=0
+    array="${1},"
+    while [ $array ]
+    do
+	range=$(echo $array | cut -d "," -f1)
+	array=$(echo $array | cut -d "," -f2-)
+	if F_GET_IP_FROM_RANGE "$range" "first"
+	then
+	    ip4_first=$(echo $ip | cut -d "." -f4)
+	else
+	    return ${err_code}
+	fi
+	if F_GET_IP_FROM_RANGE "$range" "last"
+	then
+	    ip4_last=$(echo $ip | cut -d "." -f4)
+	else
+	    return ${err_code}
+	fi
+	ip123=$(echo $ip | cut -d "." -f1-3)
+	ip4=${ip4_first}
+	while [ ${ip4} -le ${ip4_last} ]
+	do
+	    idx=$((idx+1))
+	    wan[$idx]="${ip123}.${ip4}"
+	    ip4=$((ip4+1))
+	done
+    done
+    wan_count=${idx}
+    return 0
+}
+
+#Format: $0 $array_level=mask
+#Return ${err_code}, ${nat[$level]}, ${nat_count}
+function F_LOAD_LEVELS_AND_MASKS
+{
+    array="${1},"
+    while [ $array ]
+    do
+	level=$(echo $array | cut -d "," -f1 | cut -d "=" -f1)
+	nat[$level]=$(echo $array | cut -d "," -f1 | cut -d "=" -f2)	#mask
+	array=$(echo $array | cut -d "," -f2-)
+    done
+    nat_count=${level}
+    return 0
+}
+
+#Format: $0 $chain
+#Return err_code
+function F_CREATE_CHAIN
+{
+    if [ $1 ]
+    then
+	err_code=0
+	echo "--new-chain $1" >> $F
+    else
+	err_code=1
+    fi
+    return ${err_code}
+}
+
+#Format: $0 $net $chain ${nat_count} ${wan_iface_count}
+#Return err_code
+function F_CREATE_RULE
+{
+    err_code=0
+    case $((${#2}-1)) in
+	1	)
+	    echo "-A POSTROUTING -s $1 -j $2" >> $F
+	;;
+	$3	)
+	    wan_idx=$((${wan_idx}+1))
+	    local idx=0
+	    for ((idx=1; idx<=$4; idx++))
+	    do
+		echo "-A $(echo $2 | cut -c -$((${#2}-1))) -o ${wan_iface[${idx}]} -s $1 -j SNAT --to-source ${wan[${wan_idx}]}" >> $F
+	    done
+	;;
+	*	)
+	    if [ $((${#2}-1)) -lt $3 ]
+	    then
+		echo "-A $(echo $2 | cut -c -$((${#2}-1))) -s $1 -j $2" >> $F
+	    fi
+	;;
+    esac
+    return ${err_code}
+}
+
+#Format: $0 ${single_nets} ${wan_iface_count}
+#Return err_code
+function F_CREATE_RULE_SINGLE_NET
+{
+    err_code=0
+    local idx=0
+    array="${1},"
+    while [ $array ]
+    do
+	local single_net=$(echo $array | cut -d "," -f1)
+	array=$(echo $array | cut -d "," -f2-)
+	wan_idx=$((${wan_idx}+1))
+	for ((idx=1; idx<=$2; idx++))
+	do
+	    echo "-A POSTROUTING -o ${wan_iface[${idx}]} -s ${single_net} -j SNAT --to-source ${wan[${wan_idx}]}" >> $F
+	done
+    done
+    return ${err_code}
+}
+
+#Format: $0
+#Return err_code
+function F_CLEAR_TABLE
+{
+    err_code=0
+
+    echo "*raw" > $F
+    echo "-F" >> $F
+    echo "COMMIT" >> $F
+
+    echo "*nat" >> $F
+    echo "-F" >> $F
+    echo "-X" >> $F
+
+    return ${err_code}
+}
+
+#Format: $0
+#Return err_code
+function F_HEADER
+{
+    err_code=0
+
+    echo ":PREROUTING ACCEPT" >> $F
+    echo ":POSTROUTING ACCEPT" >> $F
+    echo ":OUTPUT ACCEPT" >> $F
+
+    return ${err_code}
+}
+
+
+#Format: $0
+#Return err_code
+function F_FOOTER
+{
+    err_code=0
+
+    echo "COMMIT" >> $F
+
+    return ${err_code}
+}
+
+
+function F_DELETE_SCRIPT
+{
+    err_code=0
+
+    rm $F
+
+    return ${err_code}
+}
+
+
+#Format: $0
+#Return err_code
+function F_RUN_RULE
+{
+    err_code=0
+
+    case $out in
+	'iptables'	)
+	    $IPT < $F
+	;;
+	'console'	)
+	    cat $F
+	;;
+	'file'	)
+	;;
+	*	)
+	    err_code=5
+	;;
+    esac
+    return ${err_code}
+}
+
+
+#Format: $0 $net $level ${nat_count} ${lan_idx} ${net_idx}
+#Return err_code
+function F_LOAD_LOCAL_SUBNETS
+{
+    local i=1
+    local idx
+    local mask=$(echo $1 | cut -d "/" -f2)
+    local new_mask=${nat[$2]}
+    local n=$((2**(32-${new_mask})))
+    if [ ${new_mask} -lt ${mask} ]
+    then
+	new_mask=${mask}
+    fi
+    local k=$((2**(${new_mask}-${mask})))
+    local ip12=$(echo $1 | cut -d "." -f1-2)
+    local ip3=$(echo $1 | cut -d "." -f3)
+    local ip4=$(echo $1 | cut -d "." -f4 | cut -d "/" -f1)
+    for ((i=1; i<=$k; i++))
+    do
+	if [ $i -gt 1 ]
+	then
+	    ip4=$((${ip4}+${n}))
+	    if [ ${ip4} -ge 256 ]
+	    then
+		ip3=$((${ip3}+(${ip4}/256)))
+		ip4=0
+	    fi
+	fi
+	if [ ! ${4} ] && [ $i -eq 1 ]
+	then
+	    idx=$5
+	else
+	    idx="${4}${i}"
+	fi
+	lan[${idx}]="${ip12}.${ip3}.${ip4}/${new_mask}"
+	if [ $((${2}+1)) -le $3 ]
+	then
+	    F_LOAD_LOCAL_SUBNETS "${lan[${idx}]}" $((${2}+1)) $3 "${idx}" $5
+	fi
+    done
+    err_code=0
+    return ${err_code}
+}
+
+#Description: If mask in $NET <19, then this function divide it to several /19. If mask in NET <16, then it's ERROR
+#Return err_code
+function F_DIVIDE_NET
+{
+    local src_net=$1
+    local src_mask=$(echo ${src_net} | cut -d "/" -f2)
+    err_code=0
+
+    if [ ${src_mask} -lt 16 ]
+    then
+	err_code=6
+	return ${err_code}
+    fi
+
+    if [ ${src_mask} -lt 19 ]
+    then
+	src_mask=$((${src_mask}+1))
+	if [ ${nets} ]
+	then
+	    nets=`echo ${nets} | sed -e "s/$(echo ${src_net} | cut -d "/" -f1)\/$(echo ${src_net} | cut -d "/" -f2)/$(echo ${src_net} | cut -d "/" -f1)\/${src_mask}/g"`
+	else
+	    nets="$(echo ${src_net} | cut -d "/" -f1)/${src_mask}"
+	fi
+	F_DIVIDE_NET "$(echo ${src_net} | cut -d "/" -f1)/${src_mask}"
+	local n=$((2**(32-${src_mask})))
+	ip3=$(($(echo ${src_net} | cut -d "." -f3)+(${n}/256)))
+	nets="${nets},$(echo ${src_net} | cut -d "." -f1-2).${ip3}.0/${src_mask}"
+	F_DIVIDE_NET "$(echo ${src_net} | cut -d "." -f1-2).${ip3}.0/${src_mask}"
+    fi
+    return ${err_code}
+}
+
+#Description: Load LOCAL nets, load LEVELS and MASKS, sort LOCAL nets with needed MASKS in array ${lan[$idx]},
+#	where idx="x" - level1, idx="xx" - level2, ..., idx="x*n" - levelN
+#Return err_code
+function F_LOAD_LOCAL_NETS
+{
+    idx=0
+    err_code=0
+    nets=""
+
+    array="${1},"
+    while [ $array ]
+    do
+	idx=$((idx+1))
+	net=$(echo $array | cut -d "," -f1)
+	if ! F_DIVIDE_NET "$net"
+	then
+	    return ${err_code}
+	fi
+	if [ $nets ]
+	then
+	    net=$(echo $nets | cut -d "," -f1)
+	    array="$(echo $nets | cut -d "," -f2-),$(echo $array | cut -d "," -f2-)"
+	    nets=""
+	else
+	    array=$(echo $array | cut -d "," -f2-)
+	fi
+	if ! F_LOAD_LOCAL_SUBNETS ${net} 1 ${nat_count} "" ${idx}
+	then
+	    return ${err_code}
+	fi
+    done
+    lan_count=${idx}
+    return ${err_code}
+}
+
+#Description: Load LOCAL nets, load LEVELS and MASKS, sort LOCAL nets with needed MASKS in array ${lan[$idx]},
+#	where idx="x" - level1, idx="xx" - level2, ..., idx="x*n" - levelN
+#Return err_code
+function F_LOAD_TABLE
+{
+    nets=""
+
+    F_HEADER
+    F_LOAD_WAN_IFACES "$4"
+    idx=0
+    wan_idx=0
+    array="${1},"
+    while [ $array ]
+    do
+	idx=$((idx+1))
+	net=$(echo $array | cut -d "," -f1)
+	if ! F_DIVIDE_NET "$net"
+	then
+	    return ${err_code}
+	fi
+	if [ $nets ]
+	then
+	    net=$(echo $nets | cut -d "," -f1)
+	    array="$(echo $nets | cut -d "," -f2-),$(echo $array | cut -d "," -f2-)"
+	    nets=""
+	else
+	    array=$(echo $array | cut -d "," -f2-)
+	fi
+	if ! F_LOAD_RULES ${net} 1 ${nat_count} "" ${idx} "$2" ${wan_iface_count}
+	then
+	    return ${err_code}
+	fi
+    done
+    lan_count=${idx}
+    #backup nets
+    F_CREATE_RULE_SINGLE_NET "$3" ${wan_iface_count}
+    #exclude nets
+    F_CREATE_RULE_SINGLE_NET "$2" ${wan_iface_count}
+
+    err_code=0
+    return ${err_code}
+}
+
+#Format: $0 $net $level ${nat_count} ${lan_idx} ${net_idx} ${exclude_nets} ${wan_iface_count}
+#Return err_code
+function F_LOAD_RULES
+{
+
+    local i=1
+    local idx
+    local mask=$(echo $1 | cut -d "/" -f2)
+    local new_mask=${nat[$2]}
+    if [ ${new_mask} -lt ${mask} ]
+    then
+	new_mask=${mask}
+    fi
+    local k=$((2**(${new_mask}-${mask})))
+    for ((i=1; i<=$k; i++))
+    do
+	if [ ! ${4} ] && [ $i -eq 1 ]
+	then
+	    idx=$5
+	else
+	    idx="${4}${i}"
+	fi
+	if F_COVER_EXCLUDE "${lan[${idx}]}" "$6"
+	then
+	    continue
+	fi
+	if [ ${#idx} -lt $3 ]
+	then
+	    if ! F_CREATE_CHAIN "L${idx}"
+	    then
+		return ${err_code}
+	    fi
+	fi
+	F_CREATE_RULE "${lan[${idx}]}" "L${idx}" "$3" "$7"
+	if [ $((${2}+1)) -le $3 ]
+	then
+	    F_LOAD_RULES "${lan[${idx}]}" $((${2}+1)) "$3" "${idx}" "$5" "$6" "$7"
+	fi
+    done
+    err_code=0
+    return ${err_code}
+}
+
+#Format: $0 $net ${exclude_nets}
+#Return err_code
+function F_COVER_EXCLUDE
+{
+    local array="${2},"
+    while [ $array ]
+    do
+	local ex_net=$(echo $array | cut -d "," -f1)
+	local ex_ip12=$(echo ${ex_net} | cut -d "." -f1-2)
+	local ex_ip3_min=$(echo ${ex_net} | cut -d "." -f3)
+	local ex_ip4_min=$(echo ${ex_net} | cut -d "." -f4 | cut -d "/" -f1)
+	local n=$((2**(32-$(echo ${ex_net} | cut -d "/" -f2))))
+	if [ ${n} -ge 256 ]
+	then
+	    ex_ip3_max=$((${ex_ip3_min}+(${n}/256)-1))
+	    ex_ip4_max=255
+	fi
+	local ip12=$(echo ${1} | cut -d "." -f1-2)
+	local ip3=$(echo ${1} | cut -d "." -f3)
+	local ip4=$(echo ${1} | cut -d "." -f4 | cut -d "/" -f1)
+	if [ ${ip3} -ge ${ex_ip3_min} ] && [ ${ip3} -le ${ex_ip3_max} ] && [ ${ip4} -ge ${ex_ip4_min} ] && [ ${ip4} -le ${ex_ip4_max} ]
+	then
+	    err_code=0
+	    return ${err_code}
+	fi
+	array=$(echo $array | cut -d "," -f2-)
+    done
+    err_code=4
+    return ${err_code}
+}
+
+function F_VERSION
+{
+    echo "version = 2.0"
+    echo "date = 2018-09-23"
+    err_code=0
+    return ${err_code}
+}
+
+
+#Format: $0 $full=0|1
+#Return none
+function F_SHOW_HELP
+{
+    case "$1" in
+	0	)
+	    echo
+	    echo "USAGE:"
+	    echo "	RULE=add OUTPUT LEVEL=MASK WAN-POOLS LAN-NETS EXCLUDE-NETS BACKUP-NETS WAN-IFACES FORCE-RELOAD"
+	    echo "	RULE=delete OUTPUT"
+	    echo "	RULE=help"
+	    echo "	RULE=version"
+	    echo
+	;;
+	1	)
+	    echo
+	    echo "DESCRIPTION:"
+	    echo "	This script intended to manage rules in NAT table of IPTABLES."
+	    F_SHOW_HELP "0"
+	    echo "RULE:"
+	    echo "	\"add\" - create NAT rules to OUTPUT"
+	    echo "	\"delete\" - delete NAT rules to OUTPUT"
+	    echo "	\"help\" - show help to CONSOLE"
+	    echo "	\"version\" - show verson to CONSOLE"
+	    echo
+	    echo "OUTPUT:"
+	    echo "	\"iptables\" - load NAT rules to IPTABLES"
+	    echo "	\"file\" - load NAT rules to FILE \"${0}.log\""
+	    echo "	\"console\" - load NAT rules to CONSOLE"
+	    echo
+	    echo "LEVEL=MASK:"
+	    echo "	Format: \"1=19,2=21,...\""
+	    echo "	Example: \"1=19\" - It's pair mean LEVEL=1 and MASK=19."
+	    echo "	         \"1=19,2=21,3=23,4=26\" - May be point some pairs separated by \",\"."
+	    echo "	Note: MASK(n) must be < MASK(n+1)."
+	    echo "	      LEVEL must be 1..n."
+	    echo "	      When LEVEL=1, the MASK must be = MASK in LOCAL-NET. For example: 1=19 and 172.17.0.0/19."
+	    echo
+	    echo "WAN-POOLS:"
+	    echo "	Format: \"ip1-3.ip4[min-max],...\""
+	    echo "	Example: \"91.221.190.[1-126]\" - It's mean array from 91.221.190.1 to 91.221.190.126."
+	    echo "	         \"91.221.190.[1-126],91.221.190.[129-168],195.191.200.[1-254]\" - May be point some arrays separated by \",\"."
+	    echo "	Note: Octet 1-3 is constant, only octet 4 may be point as range."
+	    echo
+	    echo "LAN-NETS:"
+	    echo "	Format: \"subnet/mask,...\""
+	    echo "	Example: \"172.17.0.0/19,172.17.32.0/19,172.17.64.0/19,...\" - It's array of local nets separated by \",\"."
+	    echo
+	    echo "EXCLUDE-NETS:"
+	    echo "	Format: \"subnet/mask,...\""
+	    echo "	Example: \"172.17.14.0/23,172.17.16.0/20,172.17.46.0/23,...\" - It's array of exclude nets separated by \",\"."
+	    echo "	Note: It's nets, wich doesn't have own subnets. May be empty \"\"."
+	    echo
+	    echo "BACKUP-NETS:"
+	    echo "	Format: \"subnet/mask,...\""
+	    echo "	Example: \"172.17.0.0/18,172.18.0.0/16,...\" - It's array of backup nets separated by \",\"."
+	    echo "	Note: It's nets, wich may backup into own WAN-IP. May be empty \"\"."
+	    echo
+	    echo "WAN-IFACES:"
+	    echo "	Format: \"eth1,eth2.505,eth2.100.200,bond0.100,...\""
+	    echo "	Example: \"eth2.2712,eth2.231\" - It's array of WAN interfaces separated by \",\"."
+	    echo "	Note: The first interface has higher priority, then next interface."
+	    echo
+	    echo "FORCE-RELOAD:"
+	    echo "	Format: \"0\" or \"1\""
+	    echo "	Example: \"1\" - It means to force reload rules."
+	    echo
+	;;
+    esac
+}
+
+
+#============================================================================================================================================================
+#Main block
+
+rule="$1"
+
+case "$rule" in
+    'delete'	)
+	out="$2"
+	F_CLEAR_TABLE
+	F_FOOTER
+	if ! F_RUN_RULE
+	then
+	    F_SHOW_HELP "0"
+	    exit ${err_code}
+	fi
+	F_DELETE_SCRIPT
+    ;;
+    'add'	)
+	out="$2"
+	if [[ -n $9 && $9 -eq 1 ]]
+	then
+	    F_DELETE_SCRIPT
+	fi
+	if [ ! -f $F ]
+	then
+	    F_CLEAR_TABLE
+	    if ! F_LOAD_GLOBAL_ADDRESS "$4"
+	    then
+		exit ${err_code}
+	    fi
+	    F_LOAD_LEVELS_AND_MASKS "$3"
+	    if ! F_LOAD_LOCAL_NETS "$5"
+	    then
+		exit ${err_code}
+	    fi
+	    F_LOAD_TABLE "$5" "$6" "$7" "$8"
+	    F_FOOTER
+	fi
+	if ! F_RUN_RULE
+	then
+	    F_SHOW_HELP "0"
+	    exit ${err_code}
+	fi
+    ;;
+    'help'	)
+	F_SHOW_HELP "1"
+    ;;
+    'version'	)
+	F_VERSION
+    ;;
+    *	)
+	err_code=5
+	F_SHOW_HELP "0"
+    ;;
+esac
+
+
+#============================================================================================================================================================
+#End of script.
